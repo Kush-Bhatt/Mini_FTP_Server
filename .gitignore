@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Python runtime artifacts - regenerated automatically, never source
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Runtime data the programs create - not part of the submission
+# ---------------------------------------------------------------------------
+# The server re-creates this at startup; committing it would ship test files
+# and risk overwriting a grader's data.
+server_storage/
+
+# Part 3 resume bookkeeping files, written during a transfer.
+*.partial
+*.partial.meta
+
+# ---------------------------------------------------------------------------
+# Local test / scratch files - large, binary, machine-specific
+# ---------------------------------------------------------------------------
+# Auto-renamed downloads produced by the client's collision policy
+# (report.pdf -> report_1.pdf). These are copies, not sources.
+*_[0-9]*.bin
+*_[0-9]*.txt
+*_[0-9]*.pdf
+*_[0-9]*.jpg
+
+# Ad-hoc test directories and captured logs
+getdir/
+testdir/
+*.log
+
+# Packet captures for the report can be huge; keep them out of git unless
+# you deliberately force-add the one you need:  git add -f capture.pcap
+*.pcap
+*.pcapng
+
+# One-off scratch file used while bootstrapping the server
+hi.txt
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# The final tarball is a build output - rebuild it from the tracked sources
+# ---------------------------------------------------------------------------
+*.tar
+*.tar.gz
