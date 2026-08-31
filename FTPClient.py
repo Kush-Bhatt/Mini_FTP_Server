@@ -24,8 +24,9 @@ import socket
 import sys
 
 # Upper bound for a single recv() call. recv() may return fewer bytes; the
-# helpers below loop until they have what the protocol needs.
-RECV_CHUNK = 4096
+# helpers below loop until they have what the protocol needs. 64 KiB keeps
+# the syscall count low on large transfers.
+RECV_CHUNK = 65536
 
 
 # --------------------------------------------------------------------------- #
@@ -67,14 +68,16 @@ def recv_exact(conn, num_bytes, buffer):
     Raises:
         ConnectionError: The peer disconnected before num_bytes arrived.
     """
-    payload = buffer[:num_bytes]
-    buffer = buffer[num_bytes:]
+    # A bytearray grows in amortised O(1); `bytes += bytes` would recopy the
+    # whole accumulated payload every iteration (O(n^2) on large files).
+    payload = bytearray(buffer[:num_bytes])
+    leftover = buffer[num_bytes:]
     while len(payload) < num_bytes:
         data = conn.recv(min(RECV_CHUNK, num_bytes - len(payload)))
         if not data:
             raise ConnectionError("connection closed mid-transfer")
-        payload += data
-    return payload, buffer
+        payload.extend(data)
+    return bytes(payload), leftover
 
 
 def unique_local_path(name):
