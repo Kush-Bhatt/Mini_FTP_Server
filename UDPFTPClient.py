@@ -14,7 +14,7 @@ Local-file collision policy for `get`: auto-rename to name_1.ext, name_2.ext
 (first free), so an existing local file is never overwritten.
 
 Usage:
-    python3 UDPFTPClient.py <server_ip> <server_port> [--loss-rate R]
+    python3 UDPFTPClient.py <server_ip> <server_port>
 """
 
 import hashlib
@@ -96,6 +96,24 @@ def sendto(sock, packet, addr):
     sock.sendto(packet, addr)
 
 
+def drain_socket(sock):
+    """Discards every datagram currently buffered on `sock`, without blocking.
+
+    Under packet loss the previous command leaves retransmitted DATA / ACK /
+    DONE datagrams queued. If the next command's handshake reads one of those
+    instead of the real reply it desyncs (e.g. 'put rejected: DONE|...').
+    Draining at the start of each command starts it clean.
+    """
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.recvfrom(RECV_BUFSIZE)
+    except (BlockingIOError, OSError):
+        pass
+    finally:
+        sock.setblocking(True)
+
+
 def unique_local_path(name):
     """`name` if free, else name_1.ext, name_2.ext, ... (first free)."""
     if not os.path.exists(name):
@@ -129,12 +147,20 @@ def send_and_await_reply(sock, message, addr):
 def send_file_data(sock, addr, file_bytes, label):
     """Sends file_bytes as stop-and-wait DATA chunks.
 
-    Returns True once every chunk is ACKed, or False if one chunk times out
-    MAX_CHUNK_RETRIES times in a row.
+    Returns a (total_chunks, retransmitted_chunks, duplicate_acks) tuple once
+    every chunk is ACKed, or None if one chunk times out MAX_CHUNK_RETRIES
+    times in a row.
+
+      - retransmitted_chunks: one per timeout (a resend of the current chunk)
+      - duplicate_acks: ACKs received for a chunk we had already advanced past
+        (the receiver's original ACK was slow, so it arrived after we resent
+        and got the fresh one) - the sender-side view of duplicate ACKs
     """
     total = total_chunks_for(len(file_bytes))
     sock.settimeout(SOCK_TIMEOUT)
 
+    retransmits = 0
+    dup_acks = 0
     seq = 0
     while seq < total:
         chunk = file_bytes[seq * CHUNK_SIZE:(seq + 1) * CHUNK_SIZE]
@@ -142,25 +168,42 @@ def send_file_data(sock, addr, file_bytes, label):
         packet = make_data_packet(seq, is_last, chunk)
 
         retries = 0
-        while True:
+        while True:                                # (re)send loop for this chunk
             sendto(sock, packet, addr)
-            try:
-                ack, _ = sock.recvfrom(RECV_BUFSIZE)
-            except socket.timeout:
-                retries += 1
-                if retries >= MAX_CHUNK_RETRIES:
-                    print(f"Transfer failed: no ACK for chunk {seq} "
-                          f"after {MAX_CHUNK_RETRIES} retries")
-                    return False
-                continue
-            if len(ack) == 4 and parse_ack_packet(ack) == seq:
+            got_ack = False
+            while not got_ack:                     # read ACKs until ours or timeout
+                try:
+                    ack, _ = sock.recvfrom(RECV_BUFSIZE)
+                except socket.timeout:
+                    retries += 1
+                    retransmits += 1
+                    if retries >= MAX_CHUNK_RETRIES:
+                        print(f"Transfer failed: no ACK for chunk {seq} "
+                              f"after {MAX_CHUNK_RETRIES} retries")
+                        return None
+                    print(f"[{label}] no ACK for chunk {seq} - resending "
+                          f"(retry {retries}/{MAX_CHUNK_RETRIES})")
+                    break                         # resend the chunk
+                if len(ack) != 4:
+                    continue                       # not an ACK - ignore
+                acked = parse_ack_packet(ack)
+                if acked == seq:
+                    got_ack = True
+                elif acked < seq:
+                    dup_acks += 1
+                    print(f"[{label}] duplicate ACK for chunk {acked} "
+                          f"(already past it) - ignored")
+                # acked > seq is impossible under stop-and-wait
+            if got_ack:
                 break
 
         if seq % 50 == 0 or is_last:
             print(f"[{label}] sent chunk {seq + 1}/{total}")
         seq += 1
 
-    return True
+    print(f"[{label}] done: {total} chunks sent, {retransmits} retransmitted, "
+          f"{dup_acks} duplicate ACK(s)")
+    return total, retransmits, dup_acks
 
 
 # --------------------------------------------------------------------------- #
@@ -169,9 +212,13 @@ def send_file_data(sock, addr, file_bytes, label):
 def recv_file_data(sock, addr, total_chunks, out_path, label):
     """Receives DATA chunks from addr and writes them, in order, to out_path.
 
-    Returns once the is_last chunk has been received and ACKed.
+    Returns (chunks_written, duplicate_chunks) once the is_last chunk has
+    been received and ACKed. `duplicate_chunks` is how many DATA packets
+    arrived that we already had (i.e. sender retransmissions whose ACK was
+    lost) - the receiver-side view of retransmissions during a GET.
     """
     expected = 0
+    duplicates = 0
     with open(out_path, "wb") as out_file:
         while True:
             sock.settimeout(None)
@@ -189,8 +236,9 @@ def recv_file_data(sock, addr, total_chunks, out_path, label):
                 if expected % 50 == 0 or is_last:
                     print(f"[{label}] received chunk {expected}/{total_chunks}")
                 if is_last:
-                    return
+                    return expected, duplicates
             elif seq < expected:
+                duplicates += 1
                 print(f"[{label}] duplicate chunk {seq} - re-sending ACK")
                 sendto(sock, make_ack_packet(seq), addr)
             else:
@@ -201,31 +249,36 @@ def recv_file_data(sock, addr, total_chunks, out_path, label):
 def finish_as_receiver(sock, addr, local_path):
     """After recv_file_data: wait for the sender's DONE|<md5>, verify, reply.
 
-    Returns the verdict string ("VERIFIED" / "MISMATCH"), or None on giving
-    up. A retransmitted last DATA chunk is re-ACKed so the sender proceeds.
+    Returns the verdict string, or None on giving up. Under loss this must
+    survive: a retransmitted last DATA chunk (re-ACK it), and a lost verdict
+    where the server keeps resending DONE (re-send our reply each time).
     """
     our_md5 = md5_of_file(local_path)
     sock.settimeout(SOCK_TIMEOUT)
+    verdict = None
     for _ in range(FINISH_ATTEMPTS):
         try:
             packet, sender = sock.recvfrom(RECV_BUFSIZE)
         except socket.timeout:
+            if verdict is not None:
+                return verdict         # replied already, server went quiet
             continue
         if sender != addr:
             continue
 
         text = packet.decode("ascii", errors="replace")
         if text.startswith("DONE|"):
-            verdict = ("VERIFIED" if text.split("|", 1)[1] == our_md5
-                       else "MISMATCH")
-            sendto(sock, verdict.encode("ascii"), addr)
-            return verdict
-        try:
+            if verdict is None:                       # compare once
+                verdict = ("VERIFIED" if text.split("|", 1)[1] == our_md5
+                           else "MISMATCH")
+            sendto(sock, verdict.encode("ascii"), addr)   # (re)send reply
+            continue
+        try:                                          # duplicate last chunk
             seq, _, _ = parse_data_packet(packet)
             sendto(sock, make_ack_packet(seq), addr)
         except struct.error:
             pass
-    return None
+    return verdict
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +286,7 @@ def finish_as_receiver(sock, addr, local_path):
 # --------------------------------------------------------------------------- #
 def do_list(sock, server):
     """LIST: one handshake round-trip, then unpack OK|count|name,size;..."""
+    drain_socket(sock)                    # clear any leftovers from a prior transfer
     reply = send_and_await_reply(sock, "LIST", server)
     if reply is None:
         print("list: no response from server")
@@ -253,6 +307,9 @@ def do_put(sock, server, local_path):
     if not os.path.isfile(local_path):
         print(f"put: local file not found: {local_path}")
         return
+    # A leftover 'DONE|<md5>' from a previous lossy transfer would otherwise
+    # be read as this handshake's reply -> "put rejected: DONE|...".
+    drain_socket(sock)
     with open(local_path, "rb") as f:
         data = f.read()
     name = os.path.basename(local_path)
@@ -269,19 +326,29 @@ def do_put(sock, server, local_path):
 
     print(f"Uploading {name} ({len(data)} bytes, {total} chunks)...")
     start = time.time()
-    if not send_file_data(sock, server, data, name):
+    result = send_file_data(sock, server, data, name)
+    if result is None:
         return                                    # aborted at 10 retries
+    total_chunks, retransmits, dup_acks = result
     elapsed = time.time() - start
 
     verdict = send_and_await_reply(
         sock, f"DONE|{hashlib.md5(data).hexdigest()}", server)
     rate = len(data) / elapsed / 1024 if elapsed else 0.0
-    print(f"Upload complete: {name}, {len(data)} bytes in {elapsed:.2f}s "
-          f"({rate:.1f} KiB/s) -> {verdict}")
+    print(f"Upload complete: {name} -> {verdict}\n"
+          f"  file size          : {len(data)} bytes\n"
+          f"  chunks transferred : {total_chunks}\n"
+          f"  chunks retransmitted: {retransmits}\n"
+          f"  duplicate ACKs seen : {dup_acks}\n"
+          f"  transfer time      : {elapsed:.2f} s\n"
+          f"  throughput         : {rate:.1f} KiB/s")
 
 
 def do_get(sock, server, remote_name):
     """Downloads a file: handshake -> receive chunks -> verify DONE."""
+    # A stale DATA/ACK/DONE from a previous transfer would be mis-read as the
+    # GET handshake reply -> "get failed: <binary garbage>".
+    drain_socket(sock)
     reply = send_and_await_reply(sock, f"GET|{remote_name}|0", server)
     if reply is None:
         print("get: no response to handshake")
@@ -290,21 +357,29 @@ def do_get(sock, server, remote_name):
         print(f"get failed: {reply}")             # e.g. ERROR|file not found
         return
 
-    _, size_text, chunks_text = reply.split("|")
+    try:
+        _, size_text, chunks_text = reply.split("|")
+    except ValueError:
+        print(f"get failed: unexpected reply {reply!r}")
+        return
     filesize, total = int(size_text), int(chunks_text)
     local_path = unique_local_path(os.path.basename(remote_name))
     print(f"Downloading {remote_name} ({filesize} bytes, {total} chunks) "
           f"-> {local_path}")
 
     start = time.time()
-    recv_file_data(sock, server, total, local_path,
-                   os.path.basename(local_path))
+    chunks_written, duplicates = recv_file_data(
+        sock, server, total, local_path, os.path.basename(local_path))
     elapsed = time.time() - start
 
     verdict = finish_as_receiver(sock, server, local_path)
     rate = filesize / elapsed / 1024 if elapsed else 0.0
-    print(f"Download complete: {local_path}, {filesize} bytes in "
-          f"{elapsed:.2f}s ({rate:.1f} KiB/s) -> {verdict}")
+    print(f"Download complete: {local_path} -> {verdict}\n"
+          f"  file size          : {filesize} bytes\n"
+          f"  chunks transferred : {chunks_written}\n"
+          f"  duplicate chunks   : {duplicates}  (sender retransmissions seen)\n"
+          f"  transfer time      : {elapsed:.2f} s\n"
+          f"  throughput         : {rate:.1f} KiB/s")
 
 
 def command_loop(sock, server):
@@ -351,8 +426,7 @@ def main():
         del args[i:i + 2]
 
     if len(args) != 2:
-        print("Usage: python3 UDPFTPClient.py <server_ip> <server_port> "
-              "[--loss-rate R]")
+        print("Usage: python3 UDPFTPClient.py <server_ip> <server_port> ")
         sys.exit(1)
     try:
         server = (args[0], int(args[1]))
@@ -361,8 +435,7 @@ def main():
         sys.exit(1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"UDP Mini-FTP client -> {server[0]}:{server[1]} "
-          f"(loss-rate {LOSS_RATE}). Commands: put | get | list | quit")
+    print(f"UDP Mini-FTP client -> {server[0]}:{server[1]} . Commands: put | get | list | quit")
     try:
         command_loop(sock, server)
     finally:

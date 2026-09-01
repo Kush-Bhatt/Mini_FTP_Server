@@ -215,6 +215,11 @@ def command_loop(sock, buffer):
         except ConnectionError as err:
             print(f"Lost connection to server: {err}")
             break
+        except KeyboardInterrupt:
+            # Ctrl+C during a transfer: the socket is mid-message and the
+            # server discards the partial upload, so end the session.
+            print("\nTransfer interrupted by user.")
+            break
 
     return buffer
 
@@ -244,6 +249,8 @@ def main():
 
     try:
         command_loop(sock, b"")
+    except KeyboardInterrupt:            # Ctrl+C while sitting at the prompt
+        print("\nInterrupted.")
     finally:
         sock.close()
         print("Disconnected.")
